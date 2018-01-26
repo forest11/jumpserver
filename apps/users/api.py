@@ -1,40 +1,54 @@
 # ~*~ coding: utf-8 ~*~
 
 from rest_framework import generics
-from rest_framework.permissions import AllowAny
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_bulk import BulkModelViewSet
 
-from . import serializers
-from .hands import write_login_log_async
+from .serializers import UserSerializer, UserGroupSerializer, \
+    UserGroupUpdateMemeberSerializer, UserPKUpdateSerializer, \
+    UserUpdateGroupSerializer, ChangeUserPasswordSerializer
+from .tasks import write_login_log_async
 from .models import User, UserGroup
 from .permissions import IsSuperUser, IsValidUser, IsCurrentUserOrReadOnly
 from .utils import check_user_valid, generate_token
-from common.mixins import IDInFilterMixin
+from common.mixins import CustomFilterMixin
 from common.utils import get_logger
 
 
 logger = get_logger(__name__)
 
 
-class UserViewSet(IDInFilterMixin, BulkModelViewSet):
-    queryset = User.objects.all()
-    serializer_class = serializers.UserSerializer
-    permission_classes = (IsSuperUser,)
-    # filter_backends = (DjangoFilterBackend,)
+class UserViewSet(CustomFilterMixin, BulkModelViewSet):
+    queryset = User.objects.exclude(role="App")
+    # queryset = User.objects.all().exclude(role="App").order_by("date_joined")
+    serializer_class = UserSerializer
+    permission_classes = (IsSuperUser, IsAuthenticated)
     filter_fields = ('username', 'email', 'name', 'id')
+
+
+class ChangeUserPasswordApi(generics.RetrieveUpdateAPIView):
+    permission_classes = (IsSuperUser,)
+    queryset = User.objects.all()
+    serializer_class = ChangeUserPasswordSerializer
+
+    def perform_update(self, serializer):
+        user = self.get_object()
+        user.password_raw = serializer.validated_data["password"]
+        user.save()
 
 
 class UserUpdateGroupApi(generics.RetrieveUpdateAPIView):
     queryset = User.objects.all()
-    serializer_class = serializers.UserUpdateGroupSerializer
+    serializer_class = UserUpdateGroupSerializer
     permission_classes = (IsSuperUser,)
 
 
 class UserResetPasswordApi(generics.UpdateAPIView):
     queryset = User.objects.all()
-    serializer_class = serializers.UserSerializer
+    serializer_class = UserSerializer
+    permission_classes = (IsAuthenticated,)
 
     def perform_update(self, serializer):
         # Note: we are not updating the user object here.
@@ -49,7 +63,7 @@ class UserResetPasswordApi(generics.UpdateAPIView):
 
 class UserResetPKApi(generics.UpdateAPIView):
     queryset = User.objects.all()
-    serializer_class = serializers.UserSerializer
+    serializer_class = UserSerializer
 
     def perform_update(self, serializer):
         from .utils import send_reset_ssh_key_mail
@@ -61,7 +75,7 @@ class UserResetPKApi(generics.UpdateAPIView):
 
 class UserUpdatePKApi(generics.UpdateAPIView):
     queryset = User.objects.all()
-    serializer_class = serializers.UserPKUpdateSerializer
+    serializer_class = UserPKUpdateSerializer
     permission_classes = (IsCurrentUserOrReadOnly,)
 
     def perform_update(self, serializer):
@@ -70,14 +84,14 @@ class UserUpdatePKApi(generics.UpdateAPIView):
         user.save()
 
 
-class UserGroupViewSet(IDInFilterMixin, BulkModelViewSet):
+class UserGroupViewSet(CustomFilterMixin, BulkModelViewSet):
     queryset = UserGroup.objects.all()
-    serializer_class = serializers.UserGroupSerializer
+    serializer_class = UserGroupSerializer
 
 
 class UserGroupUpdateUserApi(generics.RetrieveUpdateAPIView):
     queryset = UserGroup.objects.all()
-    serializer_class = serializers.UserGroupUpdateMemeberSerializer
+    serializer_class = UserGroupUpdateMemeberSerializer
     permission_classes = (IsSuperUser,)
 
 
@@ -125,16 +139,24 @@ class UserAuthApi(APIView):
         login_ip = request.data.get('remote_addr', None)
         user_agent = request.data.get('HTTP_USER_AGENT', '')
 
+        if not login_ip:
+            x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR', '').split(',')
+            if x_forwarded_for:
+                login_ip = x_forwarded_for[0]
+            else:
+                login_ip = request.META.get("REMOTE_ADDR")
+
         user, msg = check_user_valid(
             username=username, password=password,
-            public_key=public_key)
+            public_key=public_key
+        )
 
         if user:
             token = generate_token(request, user)
             write_login_log_async.delay(
-                user.username, name=user.name,
-                user_agent=user_agent, login_ip=login_ip,
-                login_type=login_type)
+                user.username, ip=login_ip,
+                type=login_type, user_agent=user_agent,
+            )
             return Response({'token': token, 'user': user.to_json()})
         else:
             return Response({'msg': msg}, status=401)
